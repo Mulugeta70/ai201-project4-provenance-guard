@@ -14,26 +14,53 @@ class DetectionResult(TypedDict):
 
 def _vocabulary_ai_score(text: str) -> float:
     """
-    Measures vocabulary richness via Root TTR.
-    Low variety (repetitive word choice) → higher AI score.
-    Returns a float in [0, 1].
+    Signal 1: Vocabulary & Formality Analysis (composite of 3 sub-metrics).
+
+    Sub-metric 1 — Root TTR: measures lexical diversity relative to length.
+      Low diversity (repeating the same words) → AI-like.
+    Sub-metric 2 — Average word length: formal/academic writing favors longer
+      words ("implement", "implications", "transformative") while casual human
+      writing uses shorter ones ("ok", "fine", "bad"). AI tends formal.
+    Sub-metric 3 — Long-word density: fraction of words ≥ 7 characters.
+      Academic and AI prose pack in polysyllabic vocabulary; colloquial human
+      writing avoids it.
+
+    All three sub-scores are in [0, 1] (higher = more AI-like) and averaged
+    with equal weight.
     """
     words = re.findall(r'\b[a-zA-Z]+\b', text.lower())
     if len(words) < 10:
         return 0.5  # insufficient data — neutral
+
     n = len(words)
+
+    # Sub-metric 1: Root TTR (low diversity → AI-like)
     ttr = len(set(words)) / n
     rttr = ttr * math.sqrt(n)
-    # High RTTR → human-like. Map to AI score via inverse relationship.
-    # rttr ≈ 3 → ~0.57 AI; rttr ≈ 6 → ~0.40 AI; rttr ≈ 12 → ~0.25 AI
-    return max(0.0, min(1.0, 1.0 / (1.0 + rttr / 4.0)))
+    rttr_score = max(0.0, min(1.0, 1.0 / (1.0 + rttr / 4.0)))
+
+    # Sub-metric 2: Average word length (longer → more formal → AI-like)
+    # Mapping: avg_len 3 → 0.0 (very short); 5.5 → 0.5; 8+ → 1.0
+    avg_len = sum(len(w) for w in words) / n
+    len_score = max(0.0, min(1.0, (avg_len - 3.0) / 5.0))
+
+    # Sub-metric 3: Long-word density (words ≥ 7 chars; higher → more AI-like)
+    # Mapping: density 0% → 0.0; 40% → 1.0
+    long_density = sum(1 for w in words if len(w) >= 7) / n
+    density_score = min(1.0, long_density * 2.5)
+
+    return round((rttr_score + len_score + density_score) / 3.0, 4)
 
 
 def _burstiness_ai_score(text: str) -> float:
     """
-    Measures sentence length variance via coefficient of variation.
-    Uniform sentence lengths (low CoV) → higher AI score.
-    Returns a float in [0, 1].
+    Signal 2: Sentence Length Burstiness.
+
+    Measures the coefficient of variation (std / mean) of sentence lengths
+    in words. Low CoV means uniform sentence lengths → AI-like. High CoV
+    means varied rhythm (short punches mixed with long clauses) → human-like.
+
+    Returns a float in [0, 1] (higher = more AI-like).
     """
     sentences = [s.strip() for s in re.split(r'[.!?]+', text) if s.strip()]
     if len(sentences) < 3:
@@ -49,8 +76,9 @@ def _burstiness_ai_score(text: str) -> float:
     if mean == 0:
         return 0.5
     cov = statistics.stdev(lengths) / mean
-    # High CoV → human-like. Map to AI score via inverse relationship.
-    # cov ≈ 0.1 → ~0.83 AI; cov ≈ 0.5 → ~0.50 AI; cov ≈ 1.0 → ~0.33 AI
+    # cov ≈ 0.10 (very uniform) → ~0.83 AI
+    # cov ≈ 0.50 (moderate)    → ~0.50 AI
+    # cov ≈ 1.00 (very varied) → ~0.33 AI
     return max(0.0, min(1.0, 1.0 / (1.0 + cov * 2.0)))
 
 

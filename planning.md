@@ -4,32 +4,47 @@
 
 ## 1. Detection Signals
 
-### Signal 1: Vocabulary Richness (Root Type-Token Ratio)
+### Signal 1: Vocabulary & Formality Analysis (composite of 3 sub-metrics)
 
 **What it measures:**
-The ratio of unique words to total words in the text, normalized for document length using the square root of the token count. This is called Root TTR (RTTR). A high RTTR means the author draws from a wide, varied vocabulary relative to how much they wrote.
+A composite of three sub-metrics that together capture how formal, academic, and lexically homogeneous the writing is. All three sub-scores are in `[0, 1]` (higher = more AI-like) and averaged with equal weight.
 
-**Why it differs between human and AI writing:**
-LLMs are trained to minimize prediction loss — they gravitate toward the most statistically probable next token. This produces texts that lean heavily on a set of safe, high-frequency connectors and transitions ("however," "importantly," "in conclusion," "it is worth noting that"). Human writers, especially under emotional or creative pressure, pull from a more unpredictable word pool. AI-generated text across many samples shows measurably lower lexical diversity than human-written text of the same length.
+*Sub-metric 1 — Root TTR (lexical diversity):* ratio of unique words to total words, normalized by `sqrt(N)`. Low diversity → AI-like.
+
+*Sub-metric 2 — Average word length:* AI-generated text gravitates toward polysyllabic formal vocabulary ("transformative," "implications," "deployment"). Casual human writing uses shorter words ("ok," "fine," "ramen"). Mapped linearly: avg_len 3 → 0.0; avg_len 8+ → 1.0.
+
+*Sub-metric 3 — Long-word density:* fraction of words ≥ 7 characters. Academic and AI prose packs in polysyllabic vocabulary; colloquial human writing avoids it. Mapped: density 40%+ → 1.0.
+
+**Why the composite beats Root TTR alone:**
+Root TTR alone is poorly discriminative for short texts (< 100 words) because even AI-generated text uses varied vocabulary in a single paragraph — there simply aren't enough repetitions to suppress TTR. At 50 words, AI and human texts land at nearly identical RTTR values. Average word length and long-word density are stable even at 40 words and correctly separate a formal AI paragraph from a casual human anecdote.
 
 **Output format:**
-A float in `[0.0, 1.0]`. Higher means more AI-like (less vocabulary variety). Computed as:
+A float in `[0.0, 1.0]`. Higher means more AI-like. Computed as:
 
 ```
-words  = tokenize(text)              # all alphabetic tokens, lowercased
-RTTR   = (unique_words / total_words) * sqrt(total_words)
-score  = 1 / (1 + RTTR / 4)         # inverse mapping; high RTTR → low AI score
+words        = tokenize(text, pattern=r'\b[a-zA-Z]+\b')
+rttr         = (len(unique(words)) / len(words)) * sqrt(len(words))
+rttr_score   = 1 / (1 + rttr / 4)
+avg_len      = mean(len(w) for w in words)
+len_score    = clamp((avg_len - 3.0) / 5.0, 0, 1)
+long_density = count(w for w in words if len(w) >= 7) / len(words)
+density_score= min(long_density * 2.5, 1.0)
+vocab_score  = (rttr_score + len_score + density_score) / 3
 ```
-
-Calibration reference points:
-- RTTR ≈ 3 (very repetitive) → score ≈ 0.57
-- RTTR ≈ 6 (moderate variety) → score ≈ 0.40
-- RTTR ≈ 12 (high variety) → score ≈ 0.25
 
 If the text has fewer than 10 words, the function returns `0.5` (neutral, not enough data).
 
+**Calibration results (Milestone 4 test cases):**
+
+| Input | vocab_score |
+|---|---|
+| Clearly AI-generated (formal paragraph) | 0.685 |
+| Borderline formal human writing | 0.667 |
+| Lightly edited AI output | 0.502 |
+| Clearly human-written (casual) | 0.324 |
+
 **Blind spot:**
-Technical writing, legal boilerplate, and medical documentation use domain vocabulary at high frequency by necessity. A human-written clinical trial summary that repeats "patient," "dose," "administered," and "adverse event" hundreds of times will score as AI-like. The signal cannot distinguish deliberate domain specificity from statistical laziness. Short texts (< 50 words) are also unreliable because RTTR is noisy at low N.
+Formal academic writing by humans (economics papers, legal briefs) will score as AI-like because it shares the same vocabulary properties. The signal cannot distinguish formal-by-training from formal-by-stylistic-choice. Very short texts (< 30 words) remain unreliable.
 
 ---
 
