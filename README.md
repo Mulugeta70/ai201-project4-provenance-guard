@@ -245,6 +245,22 @@ is the right answer for a short ambiguous text.
 The difference between these two cases — 0.74 vs 0.39 — shows the scoring
 produces meaningful variation across the confidence range, not a constant.
 
+**Tier 1 confirmation** (confidence = 0.26, "Likely Human-Written"):
+
+To confirm the lowest tier is reachable, text with very short casual words and
+varied sentence rhythm (fragmented thoughts, mix of 2-word and 18-word
+sentences) produces:
+
+```json
+{
+  "vocab_score": 0.1343,
+  "burst_score": 0.3766,
+  "confidence": 0.2554,
+  "attribution": "likely_human",
+  "label": "Likely Human-Written"
+}
+```
+
 ---
 
 ## Transparency Labels
