@@ -18,20 +18,28 @@ limiter = Limiter(
 )
 
 _lock = threading.Lock()
-_submissions: dict = {}
-_audit_log: dict = {}
+_submissions: dict = {}       # content_id → full record
+_per_id_events: dict = {}     # content_id → list of timestamped events (for GET /audit/<id>)
+_global_log: list = []        # flat list of structured entries (for GET /log)
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def _log(submission_id: str, event: str, detail: dict = None):
+def _append_event(content_id: str, event: str, detail: dict = None):
+    """Append a raw event to the per-submission event list (used by GET /audit/<id>)."""
     entry = {"event": event, "timestamp": _now()}
     if detail:
         entry.update(detail)
     with _lock:
-        _audit_log.setdefault(submission_id, []).append(entry)
+        _per_id_events.setdefault(content_id, []).append(entry)
+
+
+def _append_log(entry: dict):
+    """Append a structured entry to the global audit log (used by GET /log)."""
+    with _lock:
+        _global_log.append(entry)
 
 
 @app.route("/health")
@@ -52,49 +60,69 @@ def submit():
         return jsonify({"error": "text exceeds 50,000 character limit"}), 400
 
     result = analyze(text)
-    submission_id = str(uuid.uuid4())
+    content_id = str(uuid.uuid4())
     created_at = _now()
 
     record = {
-        "submission_id": submission_id,
+        "content_id": content_id,
         "creator_id": creator_id,
         "text_length": len(text),
         "confidence": result["confidence"],
+        "attribution": result["attribution"],
         "label": result["label"],
         "signals": {
             "vocabulary_richness": result["vocab_score"],
             "sentence_burstiness": result["burst_score"],
         },
-        "status": "reviewed",
+        "status": "classified",
         "created_at": created_at,
     }
 
     with _lock:
-        _submissions[submission_id] = record
+        _submissions[content_id] = record
 
-    _log(submission_id, "submitted", {"creator_id": creator_id, "text_length": len(text)})
-    _log(submission_id, "analyzed", {"confidence": result["confidence"], "label": result["label"]})
+    # Per-submission event log (for GET /audit/<id>)
+    _append_event(content_id, "submitted", {"creator_id": creator_id, "text_length": len(text)})
+    _append_event(content_id, "analyzed", {
+        "confidence": result["confidence"],
+        "attribution": result["attribution"],
+        "label": result["label"],
+    })
+
+    # Global structured log entry (for GET /log)
+    _append_log({
+        "content_id": content_id,
+        "creator_id": creator_id,
+        "timestamp": created_at,
+        "attribution": result["attribution"],
+        "confidence": result["confidence"],
+        "vocab_score": result["vocab_score"],
+        "burst_score": result["burst_score"],
+        "status": "classified",
+    })
 
     return jsonify({
-        "submission_id": submission_id,
+        "content_id": content_id,
         "confidence": result["confidence"],
+        "attribution": result["attribution"],
         "label": result["label"],
         "signals": record["signals"],
-        "status": "reviewed",
+        "status": "classified",
         "created_at": created_at,
     }), 201
 
 
-@app.route("/status/<submission_id>")
-def status(submission_id):
+@app.route("/status/<content_id>")
+def status(content_id):
     with _lock:
-        record = _submissions.get(submission_id)
+        record = _submissions.get(content_id)
     if not record:
-        return jsonify({"error": "submission not found"}), 404
+        return jsonify({"error": "content not found"}), 404
 
     return jsonify({
-        "submission_id": record["submission_id"],
+        "content_id": record["content_id"],
         "confidence": record["confidence"],
+        "attribution": record["attribution"],
         "label": record["label"],
         "signals": record["signals"],
         "status": record["status"],
@@ -103,13 +131,13 @@ def status(submission_id):
     })
 
 
-@app.route("/appeal/<submission_id>", methods=["POST"])
+@app.route("/appeal/<content_id>", methods=["POST"])
 @limiter.limit("10 per minute")
-def appeal(submission_id):
+def appeal(content_id):
     with _lock:
-        record = _submissions.get(submission_id)
+        record = _submissions.get(content_id)
     if not record:
-        return jsonify({"error": "submission not found"}), 404
+        return jsonify({"error": "content not found"}), 404
 
     body = request.get_json(silent=True) or {}
     reason = body.get("reason", "").strip()
@@ -119,13 +147,23 @@ def appeal(submission_id):
         return jsonify({"error": "reason is required"}), 400
 
     with _lock:
-        _submissions[submission_id]["status"] = "under_review"
-        _submissions[submission_id]["appeal_reason"] = reason
+        _submissions[content_id]["status"] = "under_review"
+        _submissions[content_id]["appeal_reason"] = reason
 
-    _log(submission_id, "appeal_submitted", {"creator_id": creator_id, "reason": reason})
+    _append_event(content_id, "appeal_submitted", {"creator_id": creator_id, "reason": reason})
+
+    # Update the global log entry status
+    _append_log({
+        "content_id": content_id,
+        "creator_id": creator_id,
+        "timestamp": _now(),
+        "event": "appeal_submitted",
+        "reason": reason,
+        "status": "under_review",
+    })
 
     return jsonify({
-        "submission_id": submission_id,
+        "content_id": content_id,
         "status": "under_review",
         "message": (
             "Your appeal has been received and will be reviewed. "
@@ -134,17 +172,25 @@ def appeal(submission_id):
     })
 
 
-@app.route("/audit/<submission_id>")
-def audit(submission_id):
+@app.route("/audit/<content_id>")
+def audit(content_id):
     with _lock:
-        if submission_id not in _submissions:
-            return jsonify({"error": "submission not found"}), 404
-        events = list(_audit_log.get(submission_id, []))
+        if content_id not in _submissions:
+            return jsonify({"error": "content not found"}), 404
+        events = list(_per_id_events.get(content_id, []))
 
     return jsonify({
-        "submission_id": submission_id,
+        "content_id": content_id,
         "events": events,
     })
+
+
+@app.route("/log")
+def log():
+    limit = min(int(request.args.get("limit", 50)), 200)
+    with _lock:
+        entries = list(_global_log[-limit:])
+    return jsonify({"entries": entries, "total": len(_global_log)})
 
 
 if __name__ == "__main__":

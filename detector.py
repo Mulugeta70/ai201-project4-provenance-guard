@@ -8,6 +8,7 @@ class DetectionResult(TypedDict):
     vocab_score: float
     burst_score: float
     confidence: float
+    attribution: str
     label: str
 
 
@@ -24,7 +25,7 @@ def _vocabulary_ai_score(text: str) -> float:
     ttr = len(set(words)) / n
     rttr = ttr * math.sqrt(n)
     # High RTTR → human-like. Map to AI score via inverse relationship.
-    # rttr ≈ 3 → ~0.75 AI; rttr ≈ 8 → ~0.38 AI; rttr ≈ 15 → ~0.22 AI
+    # rttr ≈ 3 → ~0.57 AI; rttr ≈ 6 → ~0.40 AI; rttr ≈ 12 → ~0.25 AI
     return max(0.0, min(1.0, 1.0 / (1.0 + rttr / 4.0)))
 
 
@@ -49,11 +50,22 @@ def _burstiness_ai_score(text: str) -> float:
         return 0.5
     cov = statistics.stdev(lengths) / mean
     # High CoV → human-like. Map to AI score via inverse relationship.
-    # cov ≈ 0.1 → ~0.83 AI; cov ≈ 0.5 → ~0.5 AI; cov ≈ 1.0 → ~0.33 AI
+    # cov ≈ 0.1 → ~0.83 AI; cov ≈ 0.5 → ~0.50 AI; cov ≈ 1.0 → ~0.33 AI
     return max(0.0, min(1.0, 1.0 / (1.0 + cov * 2.0)))
 
 
+def _attribution(confidence: float) -> str:
+    """Machine-readable classification used in audit log and API responses."""
+    if confidence < 0.30:
+        return "likely_human"
+    elif confidence < 0.50:
+        return "uncertain"
+    else:
+        return "likely_ai"
+
+
 def _label(confidence: float) -> str:
+    """Human-readable transparency label shown to creators."""
     if confidence < 0.30:
         return "Likely Human-Written"
     elif confidence < 0.50:
@@ -72,5 +84,6 @@ def analyze(text: str) -> DetectionResult:
         vocab_score=round(vocab_score, 4),
         burst_score=round(burst_score, 4),
         confidence=confidence,
+        attribution=_attribution(confidence),
         label=_label(confidence),
     )
