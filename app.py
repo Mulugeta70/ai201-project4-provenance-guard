@@ -13,14 +13,14 @@ app = Flask(__name__)
 limiter = Limiter(
     get_remote_address,
     app=app,
-    default_limits=["200 per day", "50 per hour"],
+    default_limits=[],
     storage_uri="memory://",
 )
 
 _lock = threading.Lock()
-_submissions: dict = {}       # content_id → full record
-_per_id_events: dict = {}     # content_id → list of timestamped events (for GET /audit/<id>)
-_global_log: list = []        # flat list of structured entries (for GET /log)
+_submissions: dict = {}    # content_id → full record
+_per_id_events: dict = {}  # content_id → ordered list of events (for GET /audit/<id>)
+_global_log: list = []     # flat structured entries, mutated in-place on appeal (for GET /log)
 
 
 def _now() -> str:
@@ -28,7 +28,6 @@ def _now() -> str:
 
 
 def _append_event(content_id: str, event: str, detail: dict = None):
-    """Append a raw event to the per-submission event list (used by GET /audit/<id>)."""
     entry = {"event": event, "timestamp": _now()}
     if detail:
         entry.update(detail)
@@ -36,10 +35,13 @@ def _append_event(content_id: str, event: str, detail: dict = None):
         _per_id_events.setdefault(content_id, []).append(entry)
 
 
-def _append_log(entry: dict):
-    """Append a structured entry to the global audit log (used by GET /log)."""
+def _find_and_update_log(content_id: str, updates: dict):
+    """Mutate the first global log entry matching content_id in-place."""
     with _lock:
-        _global_log.append(entry)
+        for entry in _global_log:
+            if entry.get("content_id") == content_id:
+                entry.update(updates)
+                break
 
 
 @app.route("/health")
@@ -48,7 +50,8 @@ def health():
 
 
 @app.route("/submit", methods=["POST"])
-@limiter.limit("30 per minute")
+@limiter.limit("10 per minute")
+@limiter.limit("100 per day")
 def submit():
     body = request.get_json(silent=True) or {}
     text = body.get("text", "").strip()
@@ -76,29 +79,31 @@ def submit():
         },
         "status": "classified",
         "created_at": created_at,
+        "appeal_reasoning": None,
     }
 
     with _lock:
         _submissions[content_id] = record
+        _global_log.append({
+            "content_id": content_id,
+            "creator_id": creator_id,
+            "timestamp": created_at,
+            "attribution": result["attribution"],
+            "confidence": result["confidence"],
+            "vocab_score": result["vocab_score"],
+            "burst_score": result["burst_score"],
+            "label": result["label"],
+            "status": "classified",
+            "appeal_reasoning": None,
+        })
 
-    # Per-submission event log (for GET /audit/<id>)
     _append_event(content_id, "submitted", {"creator_id": creator_id, "text_length": len(text)})
     _append_event(content_id, "analyzed", {
         "confidence": result["confidence"],
         "attribution": result["attribution"],
         "label": result["label"],
-    })
-
-    # Global structured log entry (for GET /log)
-    _append_log({
-        "content_id": content_id,
-        "creator_id": creator_id,
-        "timestamp": created_at,
-        "attribution": result["attribution"],
-        "confidence": result["confidence"],
         "vocab_score": result["vocab_score"],
         "burst_score": result["burst_score"],
-        "status": "classified",
     })
 
     return jsonify({
@@ -119,7 +124,7 @@ def status(content_id):
     if not record:
         return jsonify({"error": "content not found"}), 404
 
-    return jsonify({
+    response = {
         "content_id": record["content_id"],
         "confidence": record["confidence"],
         "attribution": record["attribution"],
@@ -128,38 +133,46 @@ def status(content_id):
         "status": record["status"],
         "creator_id": record["creator_id"],
         "created_at": record["created_at"],
-    })
+    }
+    if record.get("appeal_reasoning"):
+        response["appeal_reasoning"] = record["appeal_reasoning"]
+    return jsonify(response)
 
 
-@app.route("/appeal/<content_id>", methods=["POST"])
+@app.route("/appeal", methods=["POST"])
 @limiter.limit("10 per minute")
-def appeal(content_id):
+def appeal():
+    body = request.get_json(silent=True) or {}
+    content_id = body.get("content_id", "").strip()
+    reasoning = body.get("creator_reasoning", "").strip()
+    creator_id = body.get("creator_id", "anonymous")
+
+    if not content_id:
+        return jsonify({"error": "content_id is required"}), 400
+    if not reasoning:
+        return jsonify({"error": "creator_reasoning is required"}), 400
+
     with _lock:
         record = _submissions.get(content_id)
     if not record:
         return jsonify({"error": "content not found"}), 404
 
-    body = request.get_json(silent=True) or {}
-    reason = body.get("reason", "").strip()
-    creator_id = body.get("creator_id", "anonymous")
-
-    if not reason:
-        return jsonify({"error": "reason is required"}), 400
+    appealed_at = _now()
 
     with _lock:
         _submissions[content_id]["status"] = "under_review"
-        _submissions[content_id]["appeal_reason"] = reason
+        _submissions[content_id]["appeal_reasoning"] = reasoning
 
-    _append_event(content_id, "appeal_submitted", {"creator_id": creator_id, "reason": reason})
-
-    # Update the global log entry status
-    _append_log({
-        "content_id": content_id,
-        "creator_id": creator_id,
-        "timestamp": _now(),
-        "event": "appeal_submitted",
-        "reason": reason,
+    # Update the existing global log entry in-place so GET /log reflects the appeal
+    _find_and_update_log(content_id, {
         "status": "under_review",
+        "appeal_reasoning": reasoning,
+        "appealed_at": appealed_at,
+    })
+
+    _append_event(content_id, "appeal_submitted", {
+        "creator_id": creator_id,
+        "creator_reasoning": reasoning,
     })
 
     return jsonify({
