@@ -1,93 +1,224 @@
-# Provenance Guard — Architecture Planning
-
-## Architecture Narrative
-
-A piece of text enters the system via `POST /submit`. The API layer validates the payload — confirming the `text` field is present and within the 50,000-character limit. It then passes the raw text to the **Detector**, which runs two independent statistical signals on it.
-
-**Signal 1 (Vocabulary Richness)** tokenizes the text and computes how varied the vocabulary is relative to the total word count. The resulting score is a number from 0 to 1 where higher means more AI-like.
-
-**Signal 2 (Sentence Burstiness)** splits the text into sentences, measures each sentence's word count, and computes the coefficient of variation across those lengths. A lower CoV means more uniform sentences, which is more AI-like; the signal is inverted so higher still means more AI-like.
-
-The **Confidence Scorer** combines both signal scores into a single `confidence` value (0.0 = certainly human, 1.0 = certainly AI) using a weighted average. The **Label Generator** maps that value to a human-readable transparency label ("Likely Human-Written", "Uncertain - May Be Human or AI", "Likely AI-Assisted", "Very Likely AI-Generated").
-
-The result is written to the **Storage layer** (in-memory dict) and two events are written to the **Audit Logger** — one for the submission, one for the analysis. The API returns the `submission_id`, `confidence`, `label`, signal breakdown, and status to the caller.
-
-When a creator disputes a classification, they `POST /appeal/{submission_id}` with a `reason`. The API fetches the record from Storage, flips its `status` to `under_review`, and appends an `appeal_submitted` event to the Audit Log. The caller receives confirmation and the updated status.
+# Provenance Guard — Planning Specification
 
 ---
 
-## Detection Signals
+## 1. Detection Signals
 
 ### Signal 1: Vocabulary Richness (Root Type-Token Ratio)
 
-**What it measures:** The ratio of unique words to total words, normalized for text length using the square root of the token count (Root TTR). A high RTTR means the author draws from a wide, varied vocabulary.
+**What it measures:**
+The ratio of unique words to total words in the text, normalized for document length using the square root of the token count. This is called Root TTR (RTTR). A high RTTR means the author draws from a wide, varied vocabulary relative to how much they wrote.
 
-**Why it differs:** LLMs are trained to minimize perplexity — they gravitate toward the most probable next token, which means they repeatedly reach for the same high-frequency words. Human writers, especially under emotional or creative pressure, pull from a wider, less predictable lexicon. AI-generated paragraphs often score lower on RTTR because the same safe connectors and transitions recur constantly.
+**Why it differs between human and AI writing:**
+LLMs are trained to minimize prediction loss — they gravitate toward the most statistically probable next token. This produces texts that lean heavily on a set of safe, high-frequency connectors and transitions ("however," "importantly," "in conclusion," "it is worth noting that"). Human writers, especially under emotional or creative pressure, pull from a more unpredictable word pool. AI-generated text across many samples shows measurably lower lexical diversity than human-written text of the same length.
 
-**Blind spot:** Technical writing, legal boilerplate, and medical reports use domain-specific terminology at high frequency by necessity — a human-written clinical summary might score as AI-like because "patient," "dose," and "administered" appear constantly. Short texts (< 50 words) also produce unreliable RTTR values.
+**Output format:**
+A float in `[0.0, 1.0]`. Higher means more AI-like (less vocabulary variety). Computed as:
+
+```
+words  = tokenize(text)              # all alphabetic tokens, lowercased
+RTTR   = (unique_words / total_words) * sqrt(total_words)
+score  = 1 / (1 + RTTR / 4)         # inverse mapping; high RTTR → low AI score
+```
+
+Calibration reference points:
+- RTTR ≈ 3 (very repetitive) → score ≈ 0.57
+- RTTR ≈ 6 (moderate variety) → score ≈ 0.40
+- RTTR ≈ 12 (high variety) → score ≈ 0.25
+
+If the text has fewer than 10 words, the function returns `0.5` (neutral, not enough data).
+
+**Blind spot:**
+Technical writing, legal boilerplate, and medical documentation use domain vocabulary at high frequency by necessity. A human-written clinical trial summary that repeats "patient," "dose," "administered," and "adverse event" hundreds of times will score as AI-like. The signal cannot distinguish deliberate domain specificity from statistical laziness. Short texts (< 50 words) are also unreliable because RTTR is noisy at low N.
 
 ---
 
 ### Signal 2: Sentence Length Burstiness (Coefficient of Variation)
 
-**What it measures:** The standard deviation of sentence lengths (in words) divided by the mean. A high coefficient of variation means the text mixes very short and very long sentences — high burstiness.
+**What it measures:**
+The coefficient of variation (CoV) of sentence lengths in words — that is, the standard deviation divided by the mean. A high CoV means the text mixes very short and very long sentences (bursty). A low CoV means sentences cluster around a uniform length (flat).
 
-**Why it differs:** Human writers vary sentence rhythm naturally — a short punch after a long clause, a one-word fragment for emphasis. Current LLMs tend to produce sentences that cluster around a comfortable medium length (12–20 words), resulting in low variance. Burstiness is one of the most stable stylometric signals for distinguishing AI prose.
+**Why it differs between human and AI writing:**
+Human writers vary sentence rhythm naturally — a short punch after a long clause, a one-word fragment for emphasis, a sprawling run-on when thoughts cascade. This produces high sentence-length variance. Current LLMs, absent explicit instructions, tend to produce sentences that cluster around a comfortable medium length (roughly 12–20 words per sentence), yielding low variance. Burstiness is one of the most stable stylometric signals in the literature for distinguishing AI-generated prose.
 
-**Blind spot:** Legal contracts and academic abstracts deliberately use uniform sentence structure — a human-written statute will score as AI-like. Stream-of-consciousness writing (Woolf, Kerouac) can produce high burstiness that looks human, but a very formal LLM output with explicit length instructions can match it too. Poems and bulleted lists break the sentence-splitting heuristic entirely.
+**Output format:**
+A float in `[0.0, 1.0]`. Higher means more AI-like (more uniform). Computed as:
+
+```
+sentences = split_on_sentence_boundaries(text)
+lengths   = [word_count(s) for s in sentences]
+CoV       = stdev(lengths) / mean(lengths)
+score     = 1 / (1 + CoV * 2)       # inverse mapping; high CoV → low AI score
+```
+
+Calibration reference points:
+- CoV ≈ 0.1 (nearly uniform) → score ≈ 0.83
+- CoV ≈ 0.5 (moderate variation) → score ≈ 0.50
+- CoV ≈ 1.0 (highly varied) → score ≈ 0.33
+
+If the text has fewer than 3 sentences after splitting, the function returns `0.5` (neutral).
+
+**Blind spot:**
+Legal contracts and academic abstracts deliberately use uniform sentence structure — a human-written statute will score as AI-like. Single-sentence texts (or texts with only two sentences) cannot have a meaningful standard deviation. Poetry breaks the sentence-splitting heuristic entirely because line breaks and punctuation encode rhythm differently than prose. A bulleted list with items that are all similarly short will score as extremely AI-like regardless of who wrote it.
 
 ---
 
-## False Positive Scenario
+### Combining Signals into Confidence
 
-A novelist submits their own short story. The story uses recurring motifs ("the bridge," "the dark water") which lowers vocabulary richness. The story is written in a deliberately restrained style with uniform sentence lengths for atmospheric effect. Both signals score high AI-likelihood, and the confidence lands at 0.72 — "Very Likely AI-Generated."
+Both signals return a score in `[0.0, 1.0]` where higher = more AI-like. They are combined as an **equal-weight average**:
 
-The confidence score reflects this uncertainty honestly: 0.72 is not 0.99. The label chosen ("Very Likely AI-Generated") is accurate to the score but still a misclassification. The creator reads the label and the confidence value, understands the system flagged them, and submits an appeal via `POST /appeal/{id}` with a reason explaining their stylistic choices. The status moves to `under_review`. Every step — original analysis, appeal submission — is in the audit log, so a human reviewer can trace exactly what happened.
+```
+confidence = 0.5 * vocab_score + 0.5 * burst_score
+```
 
-This scenario informed two design decisions: (1) always expose `confidence` numerically alongside the label so the degree of certainty is visible, and (2) keep the appeal path simple and immediate rather than gating it on thresholds.
+This is rounded to 4 decimal places. The equal weighting reflects that neither signal is known to be more reliable than the other given the current heuristic implementation. If more calibration data becomes available, the weights can be adjusted without changing the combining formula.
 
 ---
 
-## API Surface
+## 2. Uncertainty Representation
 
-| Method | Path | Purpose |
-|--------|------|---------|
-| `POST` | `/submit` | Submit text for analysis; returns classification |
-| `GET`  | `/status/<submission_id>` | Retrieve current classification and status |
-| `POST` | `/appeal/<submission_id>` | Dispute a classification with a written reason |
-| `GET`  | `/audit/<submission_id>` | Full event log for a submission |
-| `GET`  | `/health` | Liveness check |
+### What a confidence score means
 
-### Request / Response Contracts
+`confidence` is a continuous float in `[0.0, 1.0]`.
 
-**POST /submit**
-```
-Request:  { "text": string, "creator_id": string }
-Response: { "submission_id": uuid, "confidence": float, "label": string,
-            "signals": { "vocabulary_richness": float, "sentence_burstiness": float },
-            "status": "reviewed", "created_at": iso8601 }
-```
+- `0.0` would mean both signals simultaneously scored the text as perfectly human-like — maximally varied vocabulary, maximally bursty sentence rhythm. No real text reaches this.
+- `1.0` would mean both signals simultaneously scored the text as maximally AI-like — zero vocabulary diversity, perfectly uniform sentence lengths. No real text reaches this either.
+- `0.6` means the averaged signal output leans toward AI patterns but not strongly. At least one signal found something human-like. The system is more likely correct than not, but not confident enough to state a definitive verdict. The appropriate label is "Likely AI-Assisted" — a hedge, not a conviction.
 
-**GET /status/<id>**
-```
-Response: { "submission_id": uuid, "confidence": float, "label": string,
-            "signals": {...}, "status": string, "creator_id": string, "created_at": iso8601 }
-```
+### Threshold mapping
 
-**POST /appeal/<id>**
-```
-Request:  { "reason": string, "creator_id": string }
-Response: { "submission_id": uuid, "status": "under_review", "message": string }
-```
+| Confidence range | Label |
+|---|---|
+| `0.00 – 0.29` | Likely Human-Written |
+| `0.30 – 0.49` | Uncertain — May Be Human or AI |
+| `0.50 – 0.69` | Likely AI-Assisted |
+| `0.70 – 1.00` | Very Likely AI-Generated |
 
-**GET /audit/<id>**
-```
-Response: { "submission_id": uuid, "events": [ { "event": string, "timestamp": iso8601, ...detail } ] }
-```
+The breakpoints are intentionally asymmetric. "Uncertain" occupies the `0.30–0.49` band rather than `0.40–0.60` because the cost of incorrectly labeling a human writer as "Likely AI-Assisted" is higher than the cost of being uncertain. Pushing the uncertain zone lower means the system is reluctant to claim human authorship without meaningful signal.
+
+### How raw signal scores map to calibrated confidence
+
+No additional calibration layer is applied in this implementation. The signal functions are designed so that their outputs land in `[0.0, 1.0]` via inverse mappings that reflect the expected distributions. The combined average therefore also lands in `[0.0, 1.0]`. The thresholds above were selected by manual calibration against a small set of test cases (clearly human writing, clearly AI writing, mixed) to confirm the four tiers are all reachable and that the uncertain band is reached on ambiguous inputs.
 
 ---
 
-## System Flow Diagrams
+## 3. Transparency Label Design
+
+These are the exact strings the system returns in the `label` field. They are chosen to be:
+- Factual, not accusatory
+- Consistent in structure (statement + implication)
+- Usable without additional context
+
+### Label 1 — High-confidence human result (confidence < 0.30)
+
+```
+"Likely Human-Written"
+```
+
+Interpretation surfaced to the user: This content shows characteristics consistent with human authorship — varied vocabulary and varied sentence rhythm. Confidence: [score].
+
+### Label 2 — Uncertain result (0.30 ≤ confidence < 0.50)
+
+```
+"Uncertain — May Be Human or AI"
+```
+
+Interpretation surfaced to the user: This content shows mixed signals. It may be human-written, AI-generated, or AI-assisted in some parts. The system cannot determine origin with confidence. Confidence: [score].
+
+### Label 3 — Moderate AI confidence (0.50 ≤ confidence < 0.70)
+
+```
+"Likely AI-Assisted"
+```
+
+Interpretation surfaced to the user: This content shows patterns that commonly appear in AI-generated text. It may be fully AI-generated or heavily AI-edited. Confidence: [score].
+
+### Label 4 — High-confidence AI result (confidence ≥ 0.70)
+
+```
+"Very Likely AI-Generated"
+```
+
+Interpretation surfaced to the user: This content strongly matches statistical patterns of AI-generated text — low vocabulary diversity and uniform sentence lengths. Confidence: [score].
+
+**Design note:** Four labels, not three. Three felt like a false compromise — "likely AI" and "very likely AI" are meaningfully different responses and collapsing them loses useful signal. The creator at 0.72 and the creator at 0.97 should not see the same label.
+
+---
+
+## 4. Appeals Workflow
+
+### Who can submit an appeal
+
+Any caller who knows the `submission_id`. In this implementation there is no authentication layer — the `creator_id` field is caller-supplied and used for audit purposes only. The practical constraint is that you need the `submission_id` returned at submit time, which functions as a shared secret for the creator.
+
+### What information an appeal requires
+
+```json
+{
+  "reason": "string (required, non-empty)",
+  "creator_id": "string (optional, defaults to 'anonymous')"
+}
+```
+
+The `reason` must be a non-empty string. The system does not validate the content of the reason — any non-blank text is accepted. This is intentional: gatekeeping on reason quality adds friction without improving accuracy.
+
+### What the system does when an appeal is received
+
+1. Look up the submission by `submission_id`. Return 404 if not found.
+2. Set `status` from `"reviewed"` to `"under_review"`. Store the `appeal_reason` on the record.
+3. Append an `appeal_submitted` event to the audit log with `creator_id`, `reason`, and `timestamp`.
+4. Return `{ submission_id, status: "under_review", message }` to the caller.
+
+The original `confidence` and `label` are **not changed** at appeal time. The record preserves the original classification so a reviewer can compare it to the appeal reason. Overwriting the label before human review would defeat the audit trail.
+
+### What a human reviewer sees
+
+A reviewer examining `GET /audit/<submission_id>` sees the full event timeline:
+
+```json
+{
+  "submission_id": "...",
+  "events": [
+    { "event": "submitted",       "timestamp": "...", "creator_id": "...", "text_length": 843 },
+    { "event": "analyzed",        "timestamp": "...", "confidence": 0.72, "label": "Very Likely AI-Generated" },
+    { "event": "appeal_submitted","timestamp": "...", "creator_id": "...", "reason": "This is my novel draft, chapter 3." }
+  ]
+}
+```
+
+Combined with `GET /status/<submission_id>`, the reviewer sees the current label, the confidence score, the individual signal scores (`vocabulary_richness`, `sentence_burstiness`), and the stated reason for appeal. They have everything needed to make a determination: the classification, the raw signal evidence, and the creator's argument.
+
+---
+
+## 5. Anticipated Edge Cases
+
+### Edge case 1: Poetry with deliberate repetition
+
+A poet submits a villanelle — a form that requires two lines to repeat six times across 19 lines. The recurring lines tank vocabulary richness (high repetition of exact phrases). The fixed-form stanzas also produce near-uniform line lengths in words, which tanks the burstiness signal. The poem is deeply human — the repetition is the form — but both signals fire strongly. Expected outcome: confidence ~0.75, label "Very Likely AI-Generated" for a piece that is categorically human.
+
+**Mitigation in system design:** The confidence score (0.75) is not 0.95. The numeric value is exposed in the response alongside the label, so a reviewer can see the system's uncertainty is bounded. The creator can appeal with "this is a villanelle, a fixed form that requires repetition." The audit log captures this.
+
+### Edge case 2: Very short text (under 30 words)
+
+A creator submits a tweet-length piece: "Just finished the report. Tired but proud. The numbers tell a story." This is 13 words across 3 sentences. The vocabulary TTR for 13 words is inherently unstable — almost all words will be unique. The CoV of 3 sentence lengths is meaningful but noisy at this sample size. Both signals default to `0.5` (neutral) when below the minimum threshold, so confidence returns as `0.5` and the label is "Likely AI-Assisted" — not a meaningless result, but not a confident one either.
+
+**What this tells us:** The system systematically under-detects on short content. Short AI-generated text will often escape classification. This is the correct tradeoff — it is better to say "uncertain" than to confidently misclassify at low N.
+
+### Edge case 3: AI-generated text explicitly instructed to vary vocabulary
+
+A user prompts an LLM with "write in a diverse, colloquial style with varied sentence lengths and unusual word choices." The output may score low on both AI signals. Both heuristics measure surface statistical properties, not semantic coherence or factual accuracy. A carefully prompted LLM can produce text that defeats both signals simultaneously. The system will return "Likely Human-Written" or "Uncertain" — a false negative.
+
+**What this tells us:** Statistical surface signals have a fundamental ceiling. An adversarial actor with knowledge of the signals can engineer around them. This is a known limitation of heuristic detection, not a bug to fix.
+
+---
+
+## Architecture
+
+### Narrative
+
+A piece of text arrives at `POST /submit`. The API layer validates it (non-empty, ≤ 50,000 characters) and passes the raw text to the Detector, which runs both statistical signals independently and combines their outputs into a single confidence score. The Label Generator maps that score to a tier. The Storage layer saves the complete record, the Audit Logger appends two timestamped events (one for the submission, one for the analysis result), and the API returns the classification to the caller.
+
+When a creator disputes a result, `POST /appeal/<id>` looks up the record, transitions its status to `under_review`, logs an appeal event with the stated reason, and returns confirmation. The original confidence and label are preserved unchanged — a human reviewer uses `GET /audit/<id>` to see the complete event timeline and make a determination.
 
 ### Submission Flow
 
@@ -98,51 +229,58 @@ Client
   v
 +---------------------------+
 |   API Layer (Flask)       |
-|   validate input          |
+|   validate: non-empty,    |
+|   len <= 50,000 chars     |
 +---------------------------+
   |              |
   | text         | text
   v              v
-+------------+  +-------------------+
-| Signal 1   |  | Signal 2          |
-| Vocabulary |  | Sentence          |
-| Richness   |  | Burstiness        |
-| (Root TTR) |  | (CoV of lengths)  |
-+------------+  +-------------------+
-  |                    |
-  | vocab_score (0-1)  | burst_score (0-1)
-  +--------+-----------+
-           |
-           v
-  +---------------------+
-  | Confidence Scorer   |
-  | 0.5 * vocab_score   |
-  | + 0.5 * burst_score |
-  +---------------------+
-           |
-           | confidence (0.0 – 1.0)
-           v
-  +------------------+
-  | Label Generator  |   < 0.30 → "Likely Human-Written"
-  |                  |   < 0.50 → "Uncertain - May Be Human or AI"
-  |                  |   < 0.70 → "Likely AI-Assisted"
-  |                  |   >= 0.70 → "Very Likely AI-Generated"
-  +------------------+
-           |
-           | label, confidence, signals
-           v
-  +------------------+
-  | Storage (dict)   |  ← record keyed by submission_id
-  +------------------+
-           |
-           v
-  +------------------+
-  | Audit Logger     |  ← event: "submitted"
-  |                  |  ← event: "analyzed"
-  +------------------+
-           |
-           v
-  Response: { submission_id, confidence, label, signals, status, created_at }
++------------------+  +---------------------+
+| Signal 1         |  | Signal 2            |
+| Vocabulary       |  | Sentence Burstiness |
+| Richness         |  | (CoV of lengths)    |
+| (Root TTR)       |  |                     |
+| → float [0,1]    |  | → float [0,1]       |
++------------------+  +---------------------+
+        |                       |
+        | vocab_score           | burst_score
+        +----------+------------+
+                   |
+                   v
+        +---------------------+
+        | Confidence Scorer   |
+        | conf = 0.5*v + 0.5*b|
+        | → float [0,1]       |
+        +---------------------+
+                   |
+                   | confidence
+                   v
+        +----------------------+
+        | Label Generator      |
+        | < 0.30 → Human       |
+        | < 0.50 → Uncertain   |
+        | < 0.70 → AI-Assisted |
+        | >= 0.70 → Very Likely|
+        +----------------------+
+                   |
+                   | label + all scores
+                   v
+        +------------------+
+        | Storage (dict)   |  keyed by submission_id (uuid4)
+        +------------------+
+                   |
+                   v
+        +------------------+
+        | Audit Logger     |  event: "submitted"
+        |                  |  event: "analyzed"
+        +------------------+
+                   |
+                   v
+        Response 201: {
+          submission_id, confidence, label,
+          signals: {vocabulary_richness, sentence_burstiness},
+          status: "reviewed", created_at
+        }
 ```
 
 ### Appeal Flow
@@ -154,27 +292,106 @@ Client
   v
 +---------------------------+
 |   API Layer (Flask)       |
-|   validate input          |
+|   validate: reason present|
 +---------------------------+
            |
            v
   +------------------+
-  | Storage Lookup   |  → 404 if submission_id not found
+  | Storage Lookup   |  → 404 if not found
   +------------------+
            |
            | record found
            v
   +---------------------------+
   | Status Updater            |
-  | status: "reviewed"        |
-  |      → "under_review"     |
+  | "reviewed" → "under_review"|
+  | store appeal_reason        |
   +---------------------------+
            |
            v
   +------------------+
-  | Audit Logger     |  ← event: "appeal_submitted" { reason, creator_id }
+  | Audit Logger     |  event: "appeal_submitted"
+  |                  |  { creator_id, reason, timestamp }
   +------------------+
            |
            v
-  Response: { submission_id, status: "under_review", message }
+  Response 200: {
+    submission_id,
+    status: "under_review",
+    message: "Your appeal has been received..."
+  }
 ```
+
+---
+
+## AI Tool Plan
+
+### M3 — Submission endpoint + Signal 1 (vocabulary richness)
+
+**Spec sections to provide to the AI tool:**
+- Section 1 (Detection Signals) — Signal 1 only, including the RTTR formula, output format, and calibration reference points
+- Architecture diagram — submission flow only
+
+**What to ask for:**
+Generate a Flask application skeleton with `POST /submit` and `GET /health`. The `/submit` handler should call a `analyze(text)` function that returns `vocab_score`, `burst_score` (placeholder 0.5), `confidence`, and `label`. Implement the `_vocabulary_ai_score(text)` function using Root TTR with the inverse mapping formula provided. Include in-memory storage using a dict and uuid4 for submission IDs.
+
+**How to verify before wiring:**
+Call `_vocabulary_ai_score()` directly on three inputs:
+1. Short text (< 10 words) → expect return of `0.5`
+2. High-repetition text (same sentence repeated 10 times) → expect score > `0.55`
+3. Long text with varied vocabulary (any novel excerpt) → expect score < `0.40`
+
+Only wire into the endpoint after all three behave as expected.
+
+---
+
+### M4 — Signal 2 + confidence scoring
+
+**Spec sections to provide to the AI tool:**
+- Section 1 (Detection Signals) — Signal 2, including the CoV formula, output format, and calibration reference points
+- Section 2 (Uncertainty Representation) — threshold table and combining formula
+- Architecture diagram — confidence scorer and label generator boxes
+
+**What to ask for:**
+Implement `_burstiness_ai_score(text)` using CoV with the inverse mapping formula. Replace the placeholder `0.5` burst score in the existing `analyze()` function with the real implementation. Add the label mapping function using the exact thresholds and label strings from Section 3. Wire both into the confidence combining formula `0.5 * vocab + 0.5 * burst`.
+
+**How to verify before moving on:**
+Run `analyze()` on:
+1. Clearly AI-sounding text (flat, formal, uniform sentences all 15–18 words long, repeated vocabulary) → expect confidence > `0.60`
+2. Clearly human-sounding text (short punchy sentences mixed with long ones, varied word choice, colloquial) → expect confidence < `0.40`
+3. A text with exactly 2 sentences → expect burst_score of `0.5` (below minimum sentence count)
+
+If the scores don't separate the AI vs. human samples, revisit the inverse mapping constants.
+
+---
+
+### M5 — Production layer (labels, appeals, audit)
+
+**Spec sections to provide to the AI tool:**
+- Section 3 (Transparency Label Design) — all four label strings verbatim
+- Section 4 (Appeals Workflow) — the full workflow: who, what info, what happens on receipt, what reviewer sees
+- Architecture diagram — appeal flow
+
+**What to ask for:**
+Implement the remaining three endpoints: `GET /status/<submission_id>`, `POST /appeal/<submission_id>`, and `GET /audit/<submission_id>`. The appeal handler must: validate that `reason` is non-empty, transition `status` to `"under_review"`, store `appeal_reason` on the record, and append an `appeal_submitted` audit event. The audit endpoint must return the full event list in insertion order.
+
+**How to verify:**
+1. Submit text → confirm all four label tiers are reachable by varying the input text
+2. Submit text → call appeal → call status → confirm status is now `"under_review"` and original confidence/label are unchanged
+3. Submit text → call audit → confirm exactly two events are present (`submitted`, `analyzed`)
+4. Submit text → appeal → audit → confirm exactly three events are present, third is `appeal_submitted` with the correct reason
+
+---
+
+## Label Review
+
+The four label strings are locked before implementation begins:
+
+| Condition | Label string (exact) |
+|---|---|
+| confidence < 0.30 | `"Likely Human-Written"` |
+| 0.30 ≤ confidence < 0.50 | `"Uncertain — May Be Human or AI"` |
+| 0.50 ≤ confidence < 0.70 | `"Likely AI-Assisted"` |
+| confidence ≥ 0.70 | `"Very Likely AI-Generated"` |
+
+These strings are what `detector.py:_label()` returns and what `app.py` stores in the `label` field of every record. They should not be changed mid-implementation without updating both the spec and the implementation together.

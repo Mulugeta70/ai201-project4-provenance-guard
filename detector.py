@@ -57,7 +57,7 @@ def _label(confidence: float) -> str:
     if confidence < 0.30:
         return "Likely Human-Written"
     elif confidence < 0.50:
-        return "Uncertain - May Be Human or AI"
+        return "Uncertain — May Be Human or AI"
     elif confidence < 0.70:
         return "Likely AI-Assisted"
     else:
